@@ -21,6 +21,7 @@ import numpy as np
 import numpy.typing as npt
 import optax  # type: ignore
 import orbax.checkpoint  # type: ignore
+from cleanrl_utils.wrappers.wrappers_rd import RandomDelayWrapper, UnseenRandomDelayWrapper, AugmentedRandomDelayWrapper, NoneWrapper
 from cleanrl_utils.buffers_metaworld import MultiTaskReplayBuffer
 from cleanrl_utils.evals.metaworld_jax_eval import evaluation
 from cleanrl_utils.wrappers import metaworld_wrappers
@@ -31,10 +32,22 @@ from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type
 from torch.utils.tensorboard import SummaryWriter
 
 
+# TODO: Add wifi wrappers and tests to ensure all of these work as expected
+DELAY_TYPES = {"none": NoneWrapper,
+               "random": RandomDelayWrapper,
+               "unseen": UnseenRandomDelayWrapper,
+               "augmented": AugmentedRandomDelayWrapper}
+
+
 # Experiment management utils
 def parse_args():
     # fmt: off
     parser = argparse.ArgumentParser()
+    parser.add_argument("--delay-type", type=str, default="none", help=f"Type of time-delay ({'|'.join(DELAY_TYPES)})")
+    parser.add_argument("--min-obs-delay", type=int, default=0, help="Minimum observation delay")
+    parser.add_argument("--max-obs-delay", type=int, default=12,help="Maximum observation delay")
+    parser.add_argument("--min-act-delay", type=int, default=0, help="Minimum action delay")
+    parser.add_argument("--max-act-delay", type=int, default=12,help="Maximum action delay")
     parser.add_argument("--exp-name", type=str, default=os.path.basename(__file__).rstrip(".py"),
         help="the name of this experiment")
     parser.add_argument("--seed", type=int, default=1,
@@ -94,10 +107,11 @@ def _make_envs_common(
     max_episode_steps: Optional[int] = None,
     use_one_hot: bool = True,
     terminate_on_success: bool = False,
+    delay_wrapper: gym.Wrapper = NoneWrapper
 ) -> gym.vector.VectorEnv:
-    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
+    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int, delay_wrapper: gym.Wrapper) -> gym.Env:
         env = env_cls()
-        env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
+        env = gym.wrappers.TimeLimit(delay_wrapper(env), max_episode_steps or env.max_path_length)
         if terminate_on_success:
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -110,7 +124,7 @@ def _make_envs_common(
 
     return gym.vector.AsyncVectorEnv(
         [
-            partial(init_each_env, env_cls=env_cls, name=name, env_id=env_id)
+            partial(init_each_env, env_cls=env_cls, name=name, env_id=env_id, delay_wrapper=delay_wrapper)
             for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
         ]
     )
@@ -588,10 +602,17 @@ def update(
 # Training loop
 if __name__ == "__main__":
     # if jax.device_count("gpu") < 1:
+    #     print("[!] No GPU found")
     #     raise RuntimeError("No GPUs found, aborting. Deviecs: %s" % jax.devices())
 
     args = parse_args()
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}"
+    
+    assert args.delay_type in DELAY_TYPES.keys(), f"Unsupporter delay type. Choose from ({'|'.join(DELAY_TYPES.keys())})"
+    delay_wrapper = DELAY_TYPES[args.delay_type]
+    print(f"[!] Using {delay_wrapper.__name__}")
+    delay_range_string = "_".join(map(str, [args.min_obs_delay, args.max_obs_delay, args.min_act_delay, args.max_act_delay])) # i.e. 0_12_0_12
+    run_name = f"{args.env_id}__{args.delay_type}_{delay_range_string}__{args.exp_name}__{args.seed}"
+    print(f"[!] Run name: {run_name}")
     if args.track:
         import wandb
 
@@ -629,12 +650,12 @@ if __name__ == "__main__":
     use_one_hot_wrapper = (
         True if "MT10" in args.env_id or "MT50" in args.env_id else False
     )
-
     envs = make_envs(
         benchmark,
         args.seed,
         args.max_episode_steps,
         use_one_hot=use_one_hot_wrapper,
+        delay_wrapper=DELAY_TYPES[args.delay_type]
     )
 
     NUM_TASKS = len(benchmark.train_classes)
